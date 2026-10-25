@@ -1,14 +1,14 @@
 # HANDOFF (current state, rewrite not append)
 
-Lane: rust-analyzer-mcp-server. PM task 2026-10-25 steps 1-3 done and reported; steps 4-5 not started
-(stop=after 1-3).
+Lane: rust-analyzer-mcp-server. PM tasks 2026-10-25: steps 1-3 done; step 5 (patent sweep) done at 0.1.4; crate name
+`rust-analyzer-mcp-server` claimed by PM (0.0.0 placeholder). First real release is the PM's after sweep on main,
+CI green + protection, and the PRs below merged.
 
-Open PRs (PM merges, versions allocated: #2=0.1.1, #3=0.1.2, #4 unallocated):
-- #2 lane docs (branch lane/setup)
-- #3 fix issue #1 (lane/fix-init): when merged, post the fix on issue #1 (acknowledged+diagnosed 10-25)
-- #4 current + hosted CI (lane/current, stacked on #3; retarget to main after #3). CI 7/7 green at 7870b6c;
-  Codacy action_required: src/main.rs 1009 lines, find_rust_files complexity 9 (limit 8) -> needs PM disposition or a split.
+Stack (PM merges in order; each is based on the previous, retarget to main as the base merges):
+#3 fix issue #1 (0.1.2) -> #4 deps/CI (0.1.3) -> #5 module split (0.1.4) -> #8 Codacy complexity cleanup (0.1.5, proposed)
+#7 docs/PATENT-SWEEP.md (+addendum) stacked on #5.
 
-Follow-ups: MCP 2026-07-28 (stateless, server/discover) migration; drop tower-lsp (unmaintained) for lsp-types;
-split main.rs; crates.io decision + name claim (step 4); patent sweep before release (step 5).
+TODO when #3 merges: post the fix on issue #1 (outsider `replete`, acknowledged 10-25) and close it if they confirm or after a week.
+Open items: 5 patent hits still unread (listed in the addendum); Codacy disposition on #4/#5/#8; ROADMAP rows 7-8
+(MCP 2026-07-28 migration, tower-lsp replacement) not started.
 Untracked `supertool` binary in primary is not ours; excluded via .git/info/exclude.
