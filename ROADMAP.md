@@ -10,3 +10,8 @@ Ordered; the PM allocates versions and merges.
    (fmt, clippy -D warnings, test --locked, doc, deny, audit).
 4. Decide with evidence: publish to crates.io (at minimum claim the name).
 5. Patent sweep (`C:\Projects\PATENT-SWEEP-PROCESS.md`) before any release.
+
+Added 2026-10-25 (PM):
+6. Split `src/main.rs` into modules, no behaviour change (0.1.4).
+7. MCP spec 2026-07-28 migration (stateless, per-request version in `_meta`, `server/discover`).
+8. tower-lsp is unmaintained (0.20.0 newest): evaluate async-lsp and lsp-server with evidence, then replace.
