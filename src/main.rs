@@ -89,14 +89,108 @@ pub struct AnalysisState {
     pub file_versions: HashMap<PathBuf, u64>,
     pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     pub workspace_root: Option<PathBuf>,
+    /// rust-analyzer finished loading/indexing (experimental/serverStatus).
+    pub quiescent: bool,
 }
 
 // LSP Client for communicating with rust-analyzer
 pub struct LspClient {
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     request_id: Arc<Mutex<i64>>,
-    pending_requests: Arc<RwLock<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>>,
+    pending_requests: PendingRequests,
     _child: Child,
+}
+
+type PendingRequests =
+    Arc<RwLock<HashMap<i64, tokio::sync::oneshot::Sender<std::result::Result<Value, String>>>>>;
+
+fn path_to_uri(path: &Path) -> Result<Url> {
+    let abs = std::path::absolute(path)?;
+    Url::from_file_path(&abs).map_err(|_| anyhow!("Cannot convert {} to a file URI", abs.display()))
+}
+
+/// Key for the diagnostics map. rust-analyzer may report `c:/x` for a file we
+/// opened as `C:/x`, so compare Windows paths case-insensitively.
+fn diag_key(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Read LSP messages from rust-analyzer's stdout until it closes.
+/// Responses resolve pending requests, `publishDiagnostics` is stored in the
+/// analysis state, and server-to-client requests get a null reply.
+async fn lsp_reader(
+    stdout: tokio::process::ChildStdout,
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
+    pending: PendingRequests,
+    state: Arc<RwLock<AnalysisState>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let header = header.trim();
+            if header.is_empty() {
+                break;
+            }
+            if let Some(v) = header.strip_prefix("Content-Length:") {
+                content_length = v.trim().parse().ok();
+            }
+        }
+        let Some(len) = content_length else { continue };
+        let mut body = vec![0u8; len];
+        if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await.is_err() {
+            return;
+        }
+        let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
+
+        match (msg.get("id"), msg.get("method").and_then(Value::as_str)) {
+            (Some(id), Some(_)) => {
+                // Server-to-client request (progress create, configuration, ...).
+                let reply = json!({"jsonrpc": "2.0", "id": id, "result": null}).to_string();
+                let framed = format!("Content-Length: {}\r\n\r\n{}", reply.len(), reply);
+                let mut stdin = stdin.lock().await;
+                let _ = stdin.write_all(framed.as_bytes()).await;
+                let _ = stdin.flush().await;
+            }
+            (Some(id), None) => {
+                let tx = match id.as_i64() {
+                    Some(id) => pending.write().await.remove(&id),
+                    None => None,
+                };
+                if let Some(tx) = tx {
+                    let outcome = match msg.get("error") {
+                        Some(err) => Err(err.to_string()),
+                        None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                    };
+                    let _ = tx.send(outcome);
+                }
+            }
+            (None, Some("textDocument/publishDiagnostics")) => {
+                if let Some(params) = msg
+                    .get("params")
+                    .and_then(|p| serde_json::from_value::<PublishDiagnosticsParams>(p.clone()).ok())
+                {
+                    if let Ok(path) = params.uri.to_file_path() {
+                        state.write().await.diagnostics.insert(diag_key(&path), params.diagnostics);
+                    }
+                }
+            }
+            (None, Some("experimental/serverStatus")) => {
+                let quiescent = msg["params"]["quiescent"].as_bool().unwrap_or(false);
+                state.write().await.quiescent = quiescent;
+            }
+            _ => {}
+        }
+    }
 }
 
 // MCP Server for rust-analyzer integration
@@ -122,53 +216,65 @@ impl RustAnalyzerMcpServer {
                 file_versions: HashMap::new(),
                 diagnostics: HashMap::new(),
                 workspace_root: None,
+                quiescent: false,
             })),
             file_watcher: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn initialize_rust_analyzer(&self, workspace_root: PathBuf) -> Result<()> {
+        let workspace_root = std::path::absolute(&workspace_root)?;
         let mut child = Command::new("rust-analyzer")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
             .spawn()?;
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to open stdin"))?;
-        let _stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to open stdout"))?;
+        let stdin = Arc::new(Mutex::new(
+            child.stdin.take().ok_or_else(|| anyhow!("Failed to open stdin"))?,
+        ));
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to open stdout"))?;
+
+        let pending: PendingRequests = Arc::new(RwLock::new(HashMap::new()));
+        tokio::spawn(lsp_reader(
+            stdout,
+            stdin.clone(),
+            pending.clone(),
+            self.analysis_state.clone(),
+        ));
 
         let lsp_client = LspClient {
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             request_id: Arc::new(Mutex::new(1)),
-            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            pending_requests: pending,
             _child: child,
         };
 
-        // Initialize LSP
+        let root_uri = path_to_uri(&workspace_root)?;
         let initialize_params = json!({
-            "processId": null,
-            "rootPath": workspace_root,
-            "rootUri": format!("file://{}", workspace_root.display()),
-            "capabilities": {},
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {
+                "textDocument": {"publishDiagnostics": {}},
+                "experimental": {"serverStatusNotification": true}
+            },
             "workspaceFolders": [{
-                "uri": format!("file://{}", workspace_root.display()),
+                "uri": root_uri,
                 "name": workspace_root.file_name().unwrap_or_default().to_string_lossy()
             }]
         });
 
-        let lsp_client_mut = lsp_client;
-        lsp_client_mut.send_request("initialize", initialize_params).await?;
-        lsp_client_mut.send_notification("initialized", json!({})).await?;
+        lsp_client.send_request("initialize", initialize_params).await?;
+        lsp_client.send_notification("initialized", json!({})).await?;
 
-        // Update state
         {
             let mut state = self.analysis_state.write().await;
             state.workspace_root = Some(workspace_root.clone());
         }
 
-        *self.lsp_client.write().await = Some(lsp_client_mut);
+        *self.lsp_client.write().await = Some(lsp_client);
 
-        // Start file watcher
         self.start_file_watcher(workspace_root).await?;
 
         Ok(())
@@ -212,34 +318,44 @@ impl RustAnalyzerMcpServer {
         Ok(())
     }
 
+    /// Tell rust-analyzer the current content of `path`: didOpen the first
+    /// time, didChange (full text, next version) afterwards.
     async fn handle_file_change(
         client: &LspClient,
         path: &Path,
         analysis_state: &Arc<RwLock<AnalysisState>>,
     ) -> Result<()> {
-        let uri = format!("file://{}", path.display());
+        let uri = path_to_uri(path)?;
         let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
 
-        // Send didOpen or didChange notification
-        let params = json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": content
-            }
-        });
-
-        client.send_notification("textDocument/didOpen", params).await?;
-
-        // Update file version
-        {
+        let version = {
             let mut state = analysis_state.write().await;
-            state.file_versions.insert(path.to_path_buf(), 1);
+            let version = state.file_versions.get(path).map_or(1, |v| v + 1);
+            state.file_versions.insert(path.to_path_buf(), version);
             state.last_update = Some(Instant::now());
-        }
+            version
+        };
 
-        Ok(())
+        if version == 1 {
+            client
+                .send_notification(
+                    "textDocument/didOpen",
+                    json!({"textDocument": {
+                        "uri": uri, "languageId": "rust", "version": version, "text": content
+                    }}),
+                )
+                .await
+        } else {
+            client
+                .send_notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {"uri": uri, "version": version},
+                        "contentChanges": [{"text": content}]
+                    }),
+                )
+                .await
+        }
     }
 
     pub async fn handle_mcp_request(&self, request: McpRequest) -> Result<McpResponse> {
@@ -253,7 +369,7 @@ impl RustAnalyzerMcpServer {
                 },
                 "serverInfo": {
                     "name": "rust-analyzer-mcp-server",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             })),
             _ => Err(anyhow!("Unknown method: {}", request.method)),
@@ -382,20 +498,57 @@ impl RustAnalyzerMcpServer {
         let client_guard = self.lsp_client.read().await;
         let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
-        let uri = format!("file://{file_path}");
-        let params = json!({
-            "textDocument": {
-                "uri": uri
-            }
-        });
+        let key = diag_key(&std::path::absolute(file_path)?);
+        self.analysis_state.write().await.diagnostics.remove(&key);
+        self.open_document(client, file_path).await?;
 
-        let response = client.send_request("textDocument/publishDiagnostics", params).await?;
+        // rust-analyzer pushes diagnostics asynchronously; wait for them.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut resynced = false;
+        let diagnostics = loop {
+            let quiescent = self.analysis_state.read().await.quiescent;
+            if quiescent && !resynced {
+                // Anything published while the project was still loading is
+                // incomplete: ask again now that analysis can see everything.
+                resynced = true;
+                self.analysis_state.write().await.diagnostics.remove(&key);
+                self.open_document(client, file_path).await?;
+            } else if quiescent {
+                if let Some(d) = self.analysis_state.read().await.diagnostics.get(&key) {
+                    break d.clone();
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!("Timed out waiting for diagnostics for {file_path}"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": format!("Diagnostics for {}: {}", file_path, response)
+                "text": format!("Diagnostics for {}: {}", file_path, serde_json::to_string(&diagnostics)?)
             }]
         }))
+    }
+
+    /// Like `open_document`, but first waits for rust-analyzer to finish loading
+    /// the project; queries sent earlier are answered with empty results.
+    async fn open_ready_document(&self, client: &LspClient, file_path: &str) -> Result<Url> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !self.analysis_state.read().await.quiescent {
+            if Instant::now() >= deadline {
+                return Err(anyhow!("Timed out waiting for rust-analyzer to finish loading the project"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.open_document(client, file_path).await
+    }
+
+    /// Sync the file's current content to rust-analyzer and return its URI.
+    async fn open_document(&self, client: &LspClient, file_path: &str) -> Result<Url> {
+        let path = std::path::absolute(file_path)?;
+        Self::handle_file_change(client, &path, &self.analysis_state).await?;
+        path_to_uri(&path)
     }
 
     async fn get_hover_info(&self, args: Value) -> Result<Value> {
@@ -406,7 +559,7 @@ impl RustAnalyzerMcpServer {
         let client_guard = self.lsp_client.read().await;
         let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
-        let uri = format!("file://{file_path}");
+        let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
             "textDocument": {
                 "uri": uri
@@ -434,7 +587,7 @@ impl RustAnalyzerMcpServer {
         let client_guard = self.lsp_client.read().await;
         let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
-        let uri = format!("file://{file_path}");
+        let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
             "textDocument": {
                 "uri": uri
@@ -462,7 +615,7 @@ impl RustAnalyzerMcpServer {
         let client_guard = self.lsp_client.read().await;
         let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
-        let uri = format!("file://{file_path}");
+        let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
             "textDocument": {
                 "uri": uri
@@ -493,7 +646,7 @@ impl RustAnalyzerMcpServer {
         let client_guard = self.lsp_client.read().await;
         let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
-        let uri = format!("file://{file_path}");
+        let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
             "textDocument": {
                 "uri": uri
@@ -548,6 +701,11 @@ impl RustAnalyzerMcpServer {
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "target" || name.starts_with('.') {
+                        continue;
+                    }
                     if let Ok(mut sub_files) = Self::find_rust_files(&path).await {
                         rust_files.append(&mut sub_files);
                     }
@@ -582,19 +740,24 @@ impl LspClient {
 
         // Create a channel for the response
         let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_requests.write().await.insert(id, tx);
+
         {
-            let mut pending = self.pending_requests.write().await;
-            pending.insert(id, tx);
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(message.as_bytes()).await?;
+            stdin.flush().await?;
         }
 
-        // Send the request
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
-
         // Wait for response with timeout
-        let response = tokio::time::timeout(Duration::from_secs(10), rx).await??;
-        Ok(response)
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(e))) => Err(anyhow!("rust-analyzer error: {e}")),
+            Ok(Err(_)) => Err(anyhow!("rust-analyzer exited before answering {method}")),
+            Err(_) => {
+                self.pending_requests.write().await.remove(&id);
+                Err(anyhow!("Timed out waiting for rust-analyzer to answer {method}"))
+            }
+        }
     }
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<()> {
@@ -623,7 +786,7 @@ struct CliArgs {
 
 fn parse_args() -> CliArgs {
     let app = clap::Command::new("rust-analyzer-mcp-server")
-        .version("0.1.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("🦀 MCP Server for rust-analyzer integration")
         .author("CireSnave")
         .arg(
@@ -645,32 +808,32 @@ fn parse_args() -> CliArgs {
 }
 
 fn print_startup_banner(workspace_root: &Path) {
-    println!();
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║            🦀 Rust Analyzer MCP Server v0.1.0               ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
-    println!("🚀 Starting MCP server for workspace: {}", workspace_root.display());
-    println!();
-    println!("🛠️  Available Tools:");
-    println!("  📊 get_diagnostics     Get diagnostics for a Rust file");
-    println!("  💡 get_hover_info       Get hover information for a symbol");
-    println!("  🎯 goto_definition      Go to definition of a symbol");
-    println!("  🔍 find_references      Find all references to a symbol");
-    println!("  ✨ get_completions      Get code completions");
-    println!("  🔬 analyze_workspace    Analyze the entire workspace");
-    println!();
-    println!("📡 MCP Protocol: Ready for client connections");
-    println!("💻 Listening on stdin/stdout for MCP requests...");
-    println!();
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  🦀 Rust Analyzer MCP Server v{:<10}                      ║", env!("CARGO_PKG_VERSION"));
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("🚀 Starting MCP server for workspace: {}", workspace_root.display());
+    eprintln!();
+    eprintln!("🛠️  Available Tools:");
+    eprintln!("  📊 get_diagnostics     Get diagnostics for a Rust file");
+    eprintln!("  💡 get_hover_info       Get hover information for a symbol");
+    eprintln!("  🎯 goto_definition      Go to definition of a symbol");
+    eprintln!("  🔍 find_references      Find all references to a symbol");
+    eprintln!("  ✨ get_completions      Get code completions");
+    eprintln!("  🔬 analyze_workspace    Analyze the entire workspace");
+    eprintln!();
+    eprintln!("📡 MCP Protocol: Ready for client connections");
+    eprintln!("💻 Listening on stdin/stdout for MCP requests...");
+    eprintln!();
 }
 
 fn print_initialization_error(error: &anyhow::Error) {
-    println!("⚠️  Warning: Failed to initialize rust-analyzer");
-    println!("   Error: {}", error);
-    println!("   The MCP server will run with limited functionality");
-    println!("   Please ensure rust-analyzer is installed and accessible");
-    println!();
+    eprintln!("⚠️  Warning: Failed to initialize rust-analyzer");
+    eprintln!("   Error: {}", error);
+    eprintln!("   The MCP server will run with limited functionality");
+    eprintln!("   Please ensure rust-analyzer is installed and accessible");
+    eprintln!();
 }
 
 // Main function to run the MCP server
@@ -688,8 +851,8 @@ async fn main() -> Result<()> {
     if let Err(e) = server.initialize_rust_analyzer(workspace_root.clone()).await {
         print_initialization_error(&e);
     } else {
-        println!("✅ rust-analyzer initialized successfully");
-        println!();
+        eprintln!("✅ rust-analyzer initialized successfully");
+        eprintln!();
     }
 
     // Simple stdin/stdout MCP protocol handler
@@ -708,6 +871,10 @@ async fn main() -> Result<()> {
 
                 // Try to parse as MCP request
                 if let Ok(request) = serde_json::from_str::<McpRequest>(line.trim()) {
+                    // Notifications (no id, e.g. notifications/initialized) get no reply.
+                    if request.id.is_none() {
+                        continue;
+                    }
                     let response = server.handle_mcp_request(request).await.unwrap_or_else(|e| {
                         McpResponse {
                             jsonrpc: "2.0".to_string(),
@@ -844,6 +1011,41 @@ mod tests {
         assert!(file_names.contains(&"main.rs".to_string()));
         assert!(file_names.contains(&"lib.rs".to_string()));
         assert!(file_names.contains(&"module.rs".to_string()));
+    }
+
+    /// Regression test for issue #1: startup must complete the LSP handshake
+    /// against a real rust-analyzer and record the workspace, so tools work.
+    /// Needs `rust-analyzer` on PATH (CI: `rustup component add rust-analyzer`).
+    #[tokio::test]
+    async fn test_real_rust_analyzer_handshake() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]
+name = \"ws\"
+version = \"0.1.0\"
+edition = \"2021\"
+",
+        )
+        .unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}
+").unwrap();
+
+        let server = RustAnalyzerMcpServer::new();
+        server
+            .initialize_rust_analyzer(root.to_path_buf())
+            .await
+            .expect("rust-analyzer handshake should succeed");
+        assert!(server.analysis_state.read().await.workspace_root.is_some());
+
+        let file = root.join("src/main.rs");
+        let hover = server
+            .get_hover_info(json!({"file_path": file.display().to_string(), "line": 0, "character": 3}))
+            .await
+            .unwrap();
+        assert!(hover.to_string().contains("fn main"), "{hover}");
     }
 
     #[tokio::test]
