@@ -119,6 +119,15 @@ fn diag_key(path: &Path) -> PathBuf {
     }
 }
 
+/// Directories `analyze_workspace` does not descend into.
+fn is_skipped_dir(name: &str) -> bool {
+    name == "target" || name.starts_with('.')
+}
+
+fn is_rust_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "rs")
+}
+
 /// Read LSP messages from rust-analyzer's stdout until it closes.
 /// Responses resolve pending requests, `publishDiagnostics` is stored in the
 /// analysis state, and server-to-client requests get a null reply.
@@ -777,15 +786,12 @@ impl RustAnalyzerMcpServer {
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.is_dir() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name == "target" || name.starts_with('.') {
-                        continue;
+                    if !is_skipped_dir(&entry.file_name().to_string_lossy()) {
+                        if let Ok(mut sub_files) = Self::find_rust_files(&path).await {
+                            rust_files.append(&mut sub_files);
+                        }
                     }
-                    if let Ok(mut sub_files) = Self::find_rust_files(&path).await {
-                        rust_files.append(&mut sub_files);
-                    }
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                } else if is_rust_file(&path) {
                     rust_files.push(path);
                 }
             }

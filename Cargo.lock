@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "rust-analyzer-mcp-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
