@@ -3,16 +3,22 @@ name = "rust-analyzer-mcp-server"
 version = "0.1.2"
 edition = "2024"
 rust-version = "1.85.1"
+description = "MCP server exposing rust-analyzer (diagnostics, hover, definitions, references, completions) over stdio"
+license = "MIT"
+repository = "https://github.com/ciresnave/rust-analyzer-mcp-server"
+readme = "README.md"
+keywords = ["mcp", "rust-analyzer", "lsp"]
+categories = ["development-tools"]
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tower-lsp = "0.20"
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-notify = "6.0"
-anyhow = "1.0"
-clap = { version = "4.0", features = ["derive"] }
+serde_json = "1.0.154"
+serde = { version = "1.0.229", features = ["derive"] }
+notify = "8.2"
+anyhow = "1.0.104"
+clap = { version = "4.6", features = ["derive"] }
 
 [dev-dependencies]
-tempfile = "3.0"
-tokio-test = "0.4"
+tempfile = "3.27"
+tokio-test = "0.4.6"
