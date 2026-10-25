@@ -11,12 +11,37 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tower_lsp::lsp_types::*;
 
+/// MCP tool result carrying a single text block.
+fn text_result(text: String) -> Value {
+    json!({"content": [{"type": "text", "text": text}]})
+}
+
+fn tool(name: &str, description: &str, input_schema: Value) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema,
+    }
+}
+
+fn position_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string"},
+            "line": {"type": "integer"},
+            "character": {"type": "integer"}
+        },
+        "required": ["file_path", "line", "character"]
+    })
+}
+
 /// Directories `analyze_workspace` does not descend into.
 fn is_skipped_dir(name: &str) -> bool {
     name == "target" || name.starts_with('.')
 }
 
-fn is_rust_file(path: &Path) -> bool {
+pub(crate) fn is_rust_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "rs")
 }
 
@@ -48,8 +73,8 @@ impl RustAnalyzerMcpServer {
         }
     }
 
-    pub async fn initialize_rust_analyzer(&self, workspace_root: PathBuf) -> Result<()> {
-        let workspace_root = std::path::absolute(&workspace_root)?;
+    /// Spawn rust-analyzer and the task that reads its replies.
+    fn spawn_lsp_client(&self) -> Result<LspClient> {
         let mut child = Command::new("rust-analyzer")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -76,12 +101,17 @@ impl RustAnalyzerMcpServer {
             self.analysis_state.clone(),
         ));
 
-        let lsp_client = LspClient {
+        Ok(LspClient {
             stdin,
             request_id: Arc::new(Mutex::new(1)),
             pending_requests: pending,
             _child: child,
-        };
+        })
+    }
+
+    pub async fn initialize_rust_analyzer(&self, workspace_root: PathBuf) -> Result<()> {
+        let workspace_root = std::path::absolute(&workspace_root)?;
+        let lsp_client = self.spawn_lsp_client()?;
 
         let root_uri = path_to_uri(&workspace_root)?;
         let initialize_params = json!({
@@ -104,11 +134,7 @@ impl RustAnalyzerMcpServer {
             .send_notification("initialized", json!({}))
             .await?;
 
-        {
-            let mut state = self.analysis_state.write().await;
-            state.workspace_root = Some(workspace_root.clone());
-        }
-
+        self.analysis_state.write().await.workspace_root = Some(workspace_root.clone());
         *self.lsp_client.write().await = Some(lsp_client);
 
         self.start_file_watcher(workspace_root).await?;
@@ -116,41 +142,49 @@ impl RustAnalyzerMcpServer {
         Ok(())
     }
 
+    fn make_watcher(tx: mpsc::Sender<Event>) -> Result<notify::RecommendedWatcher> {
+        Ok(notify::recommended_watcher(
+            move |res: notify::Result<Event>| {
+                if let Ok(event) = res {
+                    if tx.blocking_send(event).is_err() {
+                        eprintln!("Failed to send file event");
+                    }
+                }
+            },
+        )?)
+    }
+
+    /// Resync every changed `.rs` file named by a filesystem event.
+    async fn sync_event_paths(
+        event: &Event,
+        lsp_client: &Arc<RwLock<Option<LspClient>>>,
+        analysis_state: &Arc<RwLock<AnalysisState>>,
+    ) {
+        if !matches!(
+            event.kind,
+            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+        ) {
+            return;
+        }
+        for path in event.paths.iter().filter(|p| is_rust_file(p)) {
+            if let Some(client) = lsp_client.read().await.as_ref() {
+                let _ = Self::handle_file_change(client, path, analysis_state).await;
+            }
+        }
+    }
+
     async fn start_file_watcher(&self, workspace_root: PathBuf) -> Result<()> {
         let analysis_state = self.analysis_state.clone();
         let lsp_client = self.lsp_client.clone();
 
         let (tx, mut rx) = mpsc::channel(100);
-
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            if let Ok(event) = res {
-                if tx.blocking_send(event).is_err() {
-                    eprintln!("Failed to send file event");
-                }
-            }
-        })?;
-
+        let mut watcher = Self::make_watcher(tx)?;
         watcher.watch(&workspace_root, RecursiveMode::Recursive)?;
-
-        // Store watcher
         *self.file_watcher.lock().await = Some(watcher);
 
-        // Spawn task to handle file events
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if let EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) =
-                    event.kind
-                {
-                    for path in &event.paths {
-                        if path.extension().is_some_and(|ext| ext == "rs") {
-                            // Notify LSP about file changes
-                            if let Some(client) = lsp_client.read().await.as_ref() {
-                                let _ =
-                                    Self::handle_file_change(client, path, &analysis_state).await;
-                            }
-                        }
-                    }
-                }
+                Self::sync_event_paths(&event, &lsp_client, &analysis_state).await;
             }
         });
 
@@ -236,10 +270,10 @@ impl RustAnalyzerMcpServer {
 
     async fn list_tools(&self) -> Result<Value> {
         let tools = vec![
-            ToolDefinition {
-                name: "get_diagnostics".to_string(),
-                description: "Get diagnostics for a Rust file".to_string(),
-                input_schema: json!({
+            tool(
+                "get_diagnostics",
+                "Get diagnostics for a Rust file",
+                json!({
                     "type": "object",
                     "properties": {
                         "file_path": {
@@ -249,69 +283,36 @@ impl RustAnalyzerMcpServer {
                     },
                     "required": ["file_path"]
                 }),
-            },
-            ToolDefinition {
-                name: "get_hover_info".to_string(),
-                description: "Get hover information for a symbol at a specific position"
-                    .to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {"type": "string"},
-                        "line": {"type": "integer"},
-                        "character": {"type": "integer"}
-                    },
-                    "required": ["file_path", "line", "character"]
-                }),
-            },
-            ToolDefinition {
-                name: "goto_definition".to_string(),
-                description: "Go to definition of a symbol".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {"type": "string"},
-                        "line": {"type": "integer"},
-                        "character": {"type": "integer"}
-                    },
-                    "required": ["file_path", "line", "character"]
-                }),
-            },
-            ToolDefinition {
-                name: "find_references".to_string(),
-                description: "Find all references to a symbol".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {"type": "string"},
-                        "line": {"type": "integer"},
-                        "character": {"type": "integer"}
-                    },
-                    "required": ["file_path", "line", "character"]
-                }),
-            },
-            ToolDefinition {
-                name: "get_completions".to_string(),
-                description: "Get code completions at a specific position".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {"type": "string"},
-                        "line": {"type": "integer"},
-                        "character": {"type": "integer"}
-                    },
-                    "required": ["file_path", "line", "character"]
-                }),
-            },
-            ToolDefinition {
-                name: "analyze_workspace".to_string(),
-                description: "Analyze the entire workspace for issues".to_string(),
-                input_schema: json!({
+            ),
+            tool(
+                "get_hover_info",
+                "Get hover information for a symbol at a specific position",
+                position_schema(),
+            ),
+            tool(
+                "goto_definition",
+                "Go to definition of a symbol",
+                position_schema(),
+            ),
+            tool(
+                "find_references",
+                "Find all references to a symbol",
+                position_schema(),
+            ),
+            tool(
+                "get_completions",
+                "Get code completions at a specific position",
+                position_schema(),
+            ),
+            tool(
+                "analyze_workspace",
+                "Analyze the entire workspace for issues",
+                json!({
                     "type": "object",
                     "properties": {},
                     "additionalProperties": false
                 }),
-            },
+            ),
         ];
 
         Ok(json!({ "tools": tools }))
@@ -348,33 +349,41 @@ impl RustAnalyzerMcpServer {
         self.analysis_state.write().await.diagnostics.remove(&key);
         self.open_document(client, file_path).await?;
 
-        // rust-analyzer pushes diagnostics asynchronously; wait for them.
+        let diagnostics = self.wait_for_diagnostics(client, file_path, &key).await?;
+        Ok(text_result(format!(
+            "Diagnostics for {}: {}",
+            file_path,
+            serde_json::to_string(&diagnostics)?
+        )))
+    }
+
+    /// rust-analyzer pushes diagnostics asynchronously; wait for them.
+    async fn wait_for_diagnostics(
+        &self,
+        client: &LspClient,
+        file_path: &str,
+        key: &Path,
+    ) -> Result<Vec<Diagnostic>> {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut resynced = false;
-        let diagnostics = loop {
+        loop {
             let quiescent = self.analysis_state.read().await.quiescent;
             if quiescent && !resynced {
                 // Anything published while the project was still loading is
                 // incomplete: ask again now that analysis can see everything.
                 resynced = true;
-                self.analysis_state.write().await.diagnostics.remove(&key);
+                self.analysis_state.write().await.diagnostics.remove(key);
                 self.open_document(client, file_path).await?;
             } else if quiescent {
-                if let Some(d) = self.analysis_state.read().await.diagnostics.get(&key) {
-                    break d.clone();
+                if let Some(d) = self.analysis_state.read().await.diagnostics.get(key) {
+                    return Ok(d.clone());
                 }
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!("Timed out waiting for diagnostics for {file_path}"));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Diagnostics for {}: {}", file_path, serde_json::to_string(&diagnostics)?)
-            }]
-        }))
+        }
     }
 
     /// Like `open_document`, but first waits for rust-analyzer to finish loading
@@ -399,7 +408,15 @@ impl RustAnalyzerMcpServer {
         path_to_uri(&path)
     }
 
-    async fn get_hover_info(&self, args: Value) -> Result<Value> {
+    /// Shared body of the position-based tools: validate arguments, wait for
+    /// rust-analyzer, sync the file, send `method`, and label the reply.
+    async fn position_request(
+        &self,
+        args: Value,
+        method: &str,
+        label: &str,
+        context: Option<Value>,
+    ) -> Result<Value> {
         let file_path = args["file_path"]
             .as_str()
             .ok_or_else(|| anyhow!("file_path required"))?;
@@ -416,140 +433,37 @@ impl RustAnalyzerMcpServer {
             .ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
         let uri = self.open_ready_document(client, file_path).await?;
-        let params = json!({
-            "textDocument": {
-                "uri": uri
-            },
-            "position": {
-                "line": line,
-                "character": character
-            }
+        let mut params = json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character}
         });
+        if let Some(context) = context {
+            params["context"] = context;
+        }
 
-        let response = client.send_request("textDocument/hover", params).await?;
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Hover info: {}", response)
-            }]
-        }))
+        let response = client.send_request(method, params).await?;
+        Ok(text_result(format!("{label}: {response}")))
+    }
+
+    async fn get_hover_info(&self, args: Value) -> Result<Value> {
+        self.position_request(args, "textDocument/hover", "Hover info", None)
+            .await
     }
 
     async fn goto_definition(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"]
-            .as_str()
-            .ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("character required"))? as u32;
-
-        let client_guard = self.lsp_client.read().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
-
-        let uri = self.open_ready_document(client, file_path).await?;
-        let params = json!({
-            "textDocument": {
-                "uri": uri
-            },
-            "position": {
-                "line": line,
-                "character": character
-            }
-        });
-
-        let response = client
-            .send_request("textDocument/definition", params)
-            .await?;
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Definition: {}", response)
-            }]
-        }))
+        self.position_request(args, "textDocument/definition", "Definition", None)
+            .await
     }
 
     async fn find_references(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"]
-            .as_str()
-            .ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("character required"))? as u32;
-
-        let client_guard = self.lsp_client.read().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
-
-        let uri = self.open_ready_document(client, file_path).await?;
-        let params = json!({
-            "textDocument": {
-                "uri": uri
-            },
-            "position": {
-                "line": line,
-                "character": character
-            },
-            "context": {
-                "includeDeclaration": true
-            }
-        });
-
-        let response = client
-            .send_request("textDocument/references", params)
-            .await?;
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("References: {}", response)
-            }]
-        }))
+        let context = json!({"includeDeclaration": true});
+        self.position_request(args, "textDocument/references", "References", Some(context))
+            .await
     }
 
     async fn get_completions(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"]
-            .as_str()
-            .ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("character required"))? as u32;
-
-        let client_guard = self.lsp_client.read().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
-
-        let uri = self.open_ready_document(client, file_path).await?;
-        let params = json!({
-            "textDocument": {
-                "uri": uri
-            },
-            "position": {
-                "line": line,
-                "character": character
-            }
-        });
-
-        let response = client
-            .send_request("textDocument/completion", params)
-            .await?;
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Completions: {}", response)
-            }]
-        }))
+        self.position_request(args, "textDocument/completion", "Completions", None)
+            .await
     }
 
     async fn analyze_workspace(&self) -> Result<Value> {
