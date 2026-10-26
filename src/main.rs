@@ -1,16 +1,34 @@
+use anyhow::{Result, anyhow};
+use clap::Arg;
+use notify::{Event, EventKind, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Mutex};
-use tokio::process::{Command, Child};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use notify::{Watcher, RecursiveMode, Event, EventKind};
-use serde_json::{json, Value};
-use serde::{Deserialize, Serialize};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tower_lsp::lsp_types::*;
-use anyhow::{Result, anyhow};
-use clap::Arg;
+
+/// Handshake-based MCP revisions this server speaks, oldest first. It only
+/// uses `initialize`, `tools/list` and `tools/call`, which these share.
+/// The stateless 2026-07-28 revision (`server/discover`) is not implemented.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] =
+    ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// Echo the client's requested version when supported, else offer our newest.
+fn negotiate_protocol_version(params: Option<&Value>) -> &'static str {
+    let requested = params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str);
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|v| Some(*v) == requested)
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len() - 1])
+}
 
 // MCP Protocol types
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,24 +72,6 @@ struct LspRequest {
     id: i64,
     method: String,
     params: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LspResponse {
-    jsonrpc: String,
-    id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<LspError>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LspError {
-    code: i64,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,6 +119,15 @@ fn diag_key(path: &Path) -> PathBuf {
     }
 }
 
+/// Directories `analyze_workspace` does not descend into.
+fn is_skipped_dir(name: &str) -> bool {
+    name == "target" || name.starts_with('.')
+}
+
+fn is_rust_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "rs")
+}
+
 /// Read LSP messages from rust-analyzer's stdout until it closes.
 /// Responses resolve pending requests, `publishDiagnostics` is stored in the
 /// analysis state, and server-to-client requests get a null reply.
@@ -147,10 +156,15 @@ async fn lsp_reader(
         }
         let Some(len) = content_length else { continue };
         let mut body = vec![0u8; len];
-        if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await.is_err() {
+        if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body)
+            .await
+            .is_err()
+        {
             return;
         }
-        let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
+        let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+            continue;
+        };
 
         match (msg.get("id"), msg.get("method").and_then(Value::as_str)) {
             (Some(id), Some(_)) => {
@@ -175,12 +189,15 @@ async fn lsp_reader(
                 }
             }
             (None, Some("textDocument/publishDiagnostics")) => {
-                if let Some(params) = msg
-                    .get("params")
-                    .and_then(|p| serde_json::from_value::<PublishDiagnosticsParams>(p.clone()).ok())
-                {
+                if let Some(params) = msg.get("params").and_then(|p| {
+                    serde_json::from_value::<PublishDiagnosticsParams>(p.clone()).ok()
+                }) {
                     if let Ok(path) = params.uri.to_file_path() {
-                        state.write().await.diagnostics.insert(diag_key(&path), params.diagnostics);
+                        state
+                            .write()
+                            .await
+                            .diagnostics
+                            .insert(diag_key(&path), params.diagnostics);
                     }
                 }
             }
@@ -232,9 +249,15 @@ impl RustAnalyzerMcpServer {
             .spawn()?;
 
         let stdin = Arc::new(Mutex::new(
-            child.stdin.take().ok_or_else(|| anyhow!("Failed to open stdin"))?,
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("Failed to open stdin"))?,
         ));
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to open stdout"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Failed to open stdout"))?;
 
         let pending: PendingRequests = Arc::new(RwLock::new(HashMap::new()));
         tokio::spawn(lsp_reader(
@@ -265,8 +288,12 @@ impl RustAnalyzerMcpServer {
             }]
         });
 
-        lsp_client.send_request("initialize", initialize_params).await?;
-        lsp_client.send_notification("initialized", json!({})).await?;
+        lsp_client
+            .send_request("initialize", initialize_params)
+            .await?;
+        lsp_client
+            .send_notification("initialized", json!({}))
+            .await?;
 
         {
             let mut state = self.analysis_state.write().await;
@@ -302,12 +329,15 @@ impl RustAnalyzerMcpServer {
         // Spawn task to handle file events
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if let EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) = event.kind {
+                if let EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) =
+                    event.kind
+                {
                     for path in &event.paths {
                         if path.extension().is_some_and(|ext| ext == "rs") {
                             // Notify LSP about file changes
                             if let Some(client) = lsp_client.read().await.as_ref() {
-                                let _ = Self::handle_file_change(client, path, &analysis_state).await;
+                                let _ =
+                                    Self::handle_file_change(client, path, &analysis_state).await;
                             }
                         }
                     }
@@ -363,7 +393,7 @@ impl RustAnalyzerMcpServer {
             "tools/list" => self.list_tools().await,
             "tools/call" => self.call_tool(request.params).await,
             "initialize" => Ok(json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiate_protocol_version(request.params.as_ref()),
                 "capabilities": {
                     "tools": {}
                 },
@@ -413,7 +443,8 @@ impl RustAnalyzerMcpServer {
             },
             ToolDefinition {
                 name: "get_hover_info".to_string(),
-                description: "Get hover information for a symbol at a specific position".to_string(),
+                description: "Get hover information for a symbol at a specific position"
+                    .to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -479,7 +510,9 @@ impl RustAnalyzerMcpServer {
 
     async fn call_tool(&self, params: Option<Value>) -> Result<Value> {
         let params = params.ok_or_else(|| anyhow!("No parameters provided"))?;
-        let tool_name = params["name"].as_str().ok_or_else(|| anyhow!("No tool name provided"))?;
+        let tool_name = params["name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("No tool name provided"))?;
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         match tool_name {
@@ -494,9 +527,13 @@ impl RustAnalyzerMcpServer {
     }
 
     async fn get_diagnostics(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"].as_str().ok_or_else(|| anyhow!("file_path required"))?;
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("file_path required"))?;
         let client_guard = self.lsp_client.read().await;
-        let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
         let key = diag_key(&std::path::absolute(file_path)?);
         self.analysis_state.write().await.diagnostics.remove(&key);
@@ -534,10 +571,12 @@ impl RustAnalyzerMcpServer {
     /// Like `open_document`, but first waits for rust-analyzer to finish loading
     /// the project; queries sent earlier are answered with empty results.
     async fn open_ready_document(&self, client: &LspClient, file_path: &str) -> Result<Url> {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_secs(300);
         while !self.analysis_state.read().await.quiescent {
             if Instant::now() >= deadline {
-                return Err(anyhow!("Timed out waiting for rust-analyzer to finish loading the project"));
+                return Err(anyhow!(
+                    "Timed out waiting for rust-analyzer to finish loading the project"
+                ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -552,12 +591,20 @@ impl RustAnalyzerMcpServer {
     }
 
     async fn get_hover_info(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"].as_str().ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"].as_u64().ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"].as_u64().ok_or_else(|| anyhow!("character required"))? as u32;
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("file_path required"))?;
+        let line = args["line"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("line required"))? as u32;
+        let character = args["character"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("character required"))? as u32;
 
         let client_guard = self.lsp_client.read().await;
-        let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
         let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
@@ -580,12 +627,20 @@ impl RustAnalyzerMcpServer {
     }
 
     async fn goto_definition(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"].as_str().ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"].as_u64().ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"].as_u64().ok_or_else(|| anyhow!("character required"))? as u32;
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("file_path required"))?;
+        let line = args["line"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("line required"))? as u32;
+        let character = args["character"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("character required"))? as u32;
 
         let client_guard = self.lsp_client.read().await;
-        let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
         let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
@@ -598,7 +653,9 @@ impl RustAnalyzerMcpServer {
             }
         });
 
-        let response = client.send_request("textDocument/definition", params).await?;
+        let response = client
+            .send_request("textDocument/definition", params)
+            .await?;
         Ok(json!({
             "content": [{
                 "type": "text",
@@ -608,12 +665,20 @@ impl RustAnalyzerMcpServer {
     }
 
     async fn find_references(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"].as_str().ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"].as_u64().ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"].as_u64().ok_or_else(|| anyhow!("character required"))? as u32;
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("file_path required"))?;
+        let line = args["line"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("line required"))? as u32;
+        let character = args["character"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("character required"))? as u32;
 
         let client_guard = self.lsp_client.read().await;
-        let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
         let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
@@ -629,7 +694,9 @@ impl RustAnalyzerMcpServer {
             }
         });
 
-        let response = client.send_request("textDocument/references", params).await?;
+        let response = client
+            .send_request("textDocument/references", params)
+            .await?;
         Ok(json!({
             "content": [{
                 "type": "text",
@@ -639,12 +706,20 @@ impl RustAnalyzerMcpServer {
     }
 
     async fn get_completions(&self, args: Value) -> Result<Value> {
-        let file_path = args["file_path"].as_str().ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"].as_u64().ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"].as_u64().ok_or_else(|| anyhow!("character required"))? as u32;
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("file_path required"))?;
+        let line = args["line"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("line required"))? as u32;
+        let character = args["character"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("character required"))? as u32;
 
         let client_guard = self.lsp_client.read().await;
-        let client = client_guard.as_ref().ok_or_else(|| anyhow!("LSP client not initialized"))?;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LSP client not initialized"))?;
 
         let uri = self.open_ready_document(client, file_path).await?;
         let params = json!({
@@ -657,7 +732,9 @@ impl RustAnalyzerMcpServer {
             }
         });
 
-        let response = client.send_request("textDocument/completion", params).await?;
+        let response = client
+            .send_request("textDocument/completion", params)
+            .await?;
         Ok(json!({
             "content": [{
                 "type": "text",
@@ -668,16 +745,21 @@ impl RustAnalyzerMcpServer {
 
     async fn analyze_workspace(&self) -> Result<Value> {
         let state = self.analysis_state.read().await;
-        let workspace_root = state.workspace_root.as_ref()
+        let workspace_root = state
+            .workspace_root
+            .as_ref()
             .ok_or_else(|| anyhow!("Workspace not initialized"))?;
 
         let mut analysis_results = Vec::new();
-        
+
         // Get all Rust files in workspace
         let rust_files = Self::find_rust_files(workspace_root).await?;
-        
+
         for file in rust_files {
-            if let Ok(diagnostics) = self.get_diagnostics(json!({"file_path": file.display().to_string()})).await {
+            if let Ok(diagnostics) = self
+                .get_diagnostics(json!({"file_path": file.display().to_string()}))
+                .await
+            {
                 analysis_results.push(json!({
                     "file": file.display().to_string(),
                     "diagnostics": diagnostics
@@ -693,7 +775,10 @@ impl RustAnalyzerMcpServer {
         }))
     }
 
-    fn find_rust_files(dir: &Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<PathBuf>>> + Send + '_>> {
+    fn find_rust_files(
+        dir: &Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<PathBuf>>> + Send + '_>>
+    {
         Box::pin(async move {
             let mut rust_files = Vec::new();
             let mut entries = tokio::fs::read_dir(dir).await?;
@@ -701,15 +786,12 @@ impl RustAnalyzerMcpServer {
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.is_dir() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name == "target" || name.starts_with('.') {
-                        continue;
+                    if !is_skipped_dir(&entry.file_name().to_string_lossy()) {
+                        if let Ok(mut sub_files) = Self::find_rust_files(&path).await {
+                            rust_files.append(&mut sub_files);
+                        }
                     }
-                    if let Ok(mut sub_files) = Self::find_rust_files(&path).await {
-                        rust_files.append(&mut sub_files);
-                    }
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                } else if is_rust_file(&path) {
                     rust_files.push(path);
                 }
             }
@@ -736,7 +818,11 @@ impl LspClient {
         };
 
         let request_json = serde_json::to_string(&request)?;
-        let message = format!("Content-Length: {}\r\n\r\n{}", request_json.len(), request_json);
+        let message = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            request_json.len(),
+            request_json
+        );
 
         // Create a channel for the response
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -755,7 +841,9 @@ impl LspClient {
             Ok(Err(_)) => Err(anyhow!("rust-analyzer exited before answering {method}")),
             Err(_) => {
                 self.pending_requests.write().await.remove(&id);
-                Err(anyhow!("Timed out waiting for rust-analyzer to answer {method}"))
+                Err(anyhow!(
+                    "Timed out waiting for rust-analyzer to answer {method}"
+                ))
             }
         }
     }
@@ -768,7 +856,11 @@ impl LspClient {
         };
 
         let notification_json = serde_json::to_string(&notification)?;
-        let message = format!("Content-Length: {}\r\n\r\n{}", notification_json.len(), notification_json);
+        let message = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            notification_json.len(),
+            notification_json
+        );
 
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(message.as_bytes()).await?;
@@ -793,11 +885,11 @@ fn parse_args() -> CliArgs {
             Arg::new("workspace")
                 .help("Workspace root directory")
                 .value_name("WORKSPACE")
-                .index(1)
+                .index(1),
         );
 
     let matches = app.get_matches();
-    
+
     let workspace_root = if let Some(workspace) = matches.get_one::<String>("workspace") {
         PathBuf::from(workspace)
     } else {
@@ -810,10 +902,16 @@ fn parse_args() -> CliArgs {
 fn print_startup_banner(workspace_root: &Path) {
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
-    eprintln!("║  🦀 Rust Analyzer MCP Server v{:<10}                      ║", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "║  🦀 Rust Analyzer MCP Server v{:<10}                      ║",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
     eprintln!();
-    eprintln!("🚀 Starting MCP server for workspace: {}", workspace_root.display());
+    eprintln!(
+        "🚀 Starting MCP server for workspace: {}",
+        workspace_root.display()
+    );
     eprintln!();
     eprintln!("🛠️  Available Tools:");
     eprintln!("  📊 get_diagnostics     Get diagnostics for a Rust file");
@@ -846,9 +944,12 @@ async fn main() -> Result<()> {
     print_startup_banner(&workspace_root);
 
     let server = RustAnalyzerMcpServer::new();
-    
+
     // Initialize rust-analyzer
-    if let Err(e) = server.initialize_rust_analyzer(workspace_root.clone()).await {
+    if let Err(e) = server
+        .initialize_rust_analyzer(workspace_root.clone())
+        .await
+    {
         print_initialization_error(&e);
     } else {
         eprintln!("✅ rust-analyzer initialized successfully");
@@ -875,8 +976,10 @@ async fn main() -> Result<()> {
                     if request.id.is_none() {
                         continue;
                     }
-                    let response = server.handle_mcp_request(request).await.unwrap_or_else(|e| {
-                        McpResponse {
+                    let response = server
+                        .handle_mcp_request(request)
+                        .await
+                        .unwrap_or_else(|e| McpResponse {
                             jsonrpc: "2.0".to_string(),
                             id: None,
                             result: None,
@@ -885,8 +988,7 @@ async fn main() -> Result<()> {
                                 message: e.to_string(),
                                 data: None,
                             }),
-                        }
-                    });
+                        });
 
                     if let Ok(response_json) = serde_json::to_string(&response) {
                         println!("{response_json}");
@@ -903,8 +1005,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_server_creation() {
@@ -916,15 +1018,12 @@ mod tests {
     async fn test_list_tools() {
         let server = RustAnalyzerMcpServer::new();
         let result = server.list_tools().await.unwrap();
-        
+
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 6);
-        
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        
+
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+
         assert!(tool_names.contains(&"get_diagnostics"));
         assert!(tool_names.contains(&"get_hover_info"));
         assert!(tool_names.contains(&"goto_definition"));
@@ -946,10 +1045,20 @@ mod tests {
         let response = server.handle_mcp_request(request).await.unwrap();
         assert!(response.result.is_some());
         assert!(response.error.is_none());
-        
+
         let result = response.result.unwrap();
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        // No version requested: offer our newest.
+        assert_eq!(result["protocolVersion"], "2025-11-25");
         assert!(result["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn test_protocol_negotiation() {
+        let ask = |v: &str| negotiate_protocol_version(Some(&json!({"protocolVersion": v})));
+        assert_eq!(ask("2024-11-05"), "2024-11-05");
+        assert_eq!(ask("2025-06-18"), "2025-06-18");
+        assert_eq!(ask("2099-01-01"), "2025-11-25");
+        assert_eq!(negotiate_protocol_version(None), "2025-11-25");
     }
 
     #[tokio::test]
@@ -992,22 +1101,24 @@ mod tests {
         fs::write(temp_path.join("main.rs"), "fn main() {}").unwrap();
         fs::write(temp_path.join("lib.rs"), "pub fn test() {}").unwrap();
         fs::write(temp_path.join("README.md"), "# Test").unwrap();
-        
+
         // Create a subdirectory with more rust files
         let sub_dir = temp_path.join("src");
         fs::create_dir(&sub_dir).unwrap();
         fs::write(sub_dir.join("module.rs"), "pub mod test;").unwrap();
 
-        let rust_files = RustAnalyzerMcpServer::find_rust_files(temp_path).await.unwrap();
-        
+        let rust_files = RustAnalyzerMcpServer::find_rust_files(temp_path)
+            .await
+            .unwrap();
+
         // Should find 3 rust files
         assert_eq!(rust_files.len(), 3);
-        
+
         let file_names: Vec<String> = rust_files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        
+
         assert!(file_names.contains(&"main.rs".to_string()));
         assert!(file_names.contains(&"lib.rs".to_string()));
         assert!(file_names.contains(&"module.rs".to_string()));
@@ -1030,8 +1141,12 @@ edition = \"2021\"
         )
         .unwrap();
         fs::create_dir(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "fn main() {}
-").unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() {}
+",
+        )
+        .unwrap();
 
         let server = RustAnalyzerMcpServer::new();
         server
@@ -1042,7 +1157,9 @@ edition = \"2021\"
 
         let file = root.join("src/main.rs");
         let hover = server
-            .get_hover_info(json!({"file_path": file.display().to_string(), "line": 0, "character": 3}))
+            .get_hover_info(
+                json!({"file_path": file.display().to_string(), "line": 0, "character": 3}),
+            )
             .await
             .unwrap();
         assert!(hover.to_string().contains("fn main"), "{hover}");
@@ -1052,7 +1169,7 @@ edition = \"2021\"
     async fn test_analysis_state_update() {
         let server = RustAnalyzerMcpServer::new();
         let test_path = PathBuf::from("/test/path");
-        
+
         {
             let mut state = server.analysis_state.write().await;
             state.workspace_root = Some(test_path.clone());
