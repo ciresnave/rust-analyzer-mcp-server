@@ -36,6 +36,25 @@ fn position_schema() -> Value {
     })
 }
 
+/// `file_path`, `line` and `character` of a position-based tool call.
+fn position_args(args: &Value) -> Result<(&str, u32, u32)> {
+    let file_path = args["file_path"]
+        .as_str()
+        .ok_or_else(|| anyhow!("file_path required"))?;
+    Ok((
+        file_path,
+        required_u32(args, "line")?,
+        required_u32(args, "character")?,
+    ))
+}
+
+fn required_u32(args: &Value, name: &str) -> Result<u32> {
+    let value = args[name]
+        .as_u64()
+        .ok_or_else(|| anyhow!("{name} required"))?;
+    Ok(value as u32)
+}
+
 /// Directories `analyze_workspace` does not descend into.
 fn is_skipped_dir(name: &str) -> bool {
     name == "target" || name.starts_with('.')
@@ -417,15 +436,7 @@ impl RustAnalyzerMcpServer {
         label: &str,
         context: Option<Value>,
     ) -> Result<Value> {
-        let file_path = args["file_path"]
-            .as_str()
-            .ok_or_else(|| anyhow!("file_path required"))?;
-        let line = args["line"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("line required"))? as u32;
-        let character = args["character"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("character required"))? as u32;
+        let (file_path, line, character) = position_args(&args)?;
 
         let client_guard = self.lsp_client.read().await;
         let client = client_guard
