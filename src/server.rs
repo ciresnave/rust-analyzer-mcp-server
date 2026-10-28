@@ -1,6 +1,7 @@
 use crate::lsp::*;
 use crate::protocol::*;
 use anyhow::{Result, anyhow};
+use lsp_types::*;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tower_lsp::lsp_types::*;
+use url::Url;
 
 /// MCP tool result carrying a single text block.
 fn text_result(text: String) -> Value {
