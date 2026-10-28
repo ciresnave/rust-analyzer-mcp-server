@@ -73,75 +73,91 @@ pub(crate) async fn lsp_reader(
     state: Arc<RwLock<AnalysisState>>,
 ) {
     let mut reader = BufReader::new(stdout);
-    loop {
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut header = String::new();
-            match reader.read_line(&mut header).await {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-            let header = header.trim();
-            if header.is_empty() {
-                break;
-            }
-            if let Some(v) = header.strip_prefix("Content-Length:") {
-                content_length = v.trim().parse().ok();
-            }
-        }
-        let Some(len) = content_length else { continue };
-        let mut body = vec![0u8; len];
-        if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body)
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
-            continue;
-        };
+    while let Some(msg) = read_message(&mut reader).await {
+        handle_message(&msg, &stdin, &pending, &state).await;
+    }
+}
 
-        match (msg.get("id"), msg.get("method").and_then(Value::as_str)) {
-            (Some(id), Some(_)) => {
-                // Server-to-client request (progress create, configuration, ...).
-                let reply = json!({"jsonrpc": "2.0", "id": id, "result": null}).to_string();
-                let framed = format!("Content-Length: {}\r\n\r\n{}", reply.len(), reply);
-                let mut stdin = stdin.lock().await;
-                let _ = stdin.write_all(framed.as_bytes()).await;
-                let _ = stdin.flush().await;
-            }
-            (Some(id), None) => {
-                let tx = match id.as_i64() {
-                    Some(id) => pending.write().await.remove(&id),
-                    None => None,
-                };
-                if let Some(tx) = tx {
-                    let outcome = match msg.get("error") {
-                        Some(err) => Err(err.to_string()),
-                        None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
-                    };
-                    let _ = tx.send(outcome);
-                }
-            }
-            (None, Some("textDocument/publishDiagnostics")) => {
-                if let Some(params) = msg.get("params").and_then(|p| {
-                    serde_json::from_value::<PublishDiagnosticsParams>(p.clone()).ok()
-                }) {
-                    if let Ok(path) = params.uri.to_file_path() {
-                        state
-                            .write()
-                            .await
-                            .diagnostics
-                            .insert(diag_key(&path), params.diagnostics);
-                    }
-                }
-            }
-            (None, Some("experimental/serverStatus")) => {
-                let quiescent = msg["params"]["quiescent"].as_bool().unwrap_or(false);
-                state.write().await.quiescent = quiescent;
-            }
-            _ => {}
+/// Read one framed LSP message. `None` means the stream closed; a malformed
+/// message yields `Value::Null`, which `handle_message` ignores.
+async fn read_message(reader: &mut BufReader<tokio::process::ChildStdout>) -> Option<Value> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut header = String::new();
+        match reader.read_line(&mut header).await {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
         }
+        let header = header.trim();
+        if header.is_empty() {
+            break;
+        }
+        if let Some(v) = header.strip_prefix("Content-Length:") {
+            content_length = v.trim().parse().ok();
+        }
+    }
+    let Some(len) = content_length else {
+        return Some(Value::Null);
+    };
+    let mut body = vec![0u8; len];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut body)
+        .await
+        .ok()?;
+    Some(serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn handle_message(
+    msg: &Value,
+    stdin: &Arc<Mutex<tokio::process::ChildStdin>>,
+    pending: &PendingRequests,
+    state: &Arc<RwLock<AnalysisState>>,
+) {
+    match (msg.get("id"), msg.get("method").and_then(Value::as_str)) {
+        // Server-to-client request (progress create, configuration, ...).
+        (Some(id), Some(_)) => reply_null(stdin, id).await,
+        (Some(id), None) => resolve_pending(pending, id, msg).await,
+        (None, Some("textDocument/publishDiagnostics")) => store_diagnostics(state, msg).await,
+        (None, Some("experimental/serverStatus")) => {
+            let quiescent = msg["params"]["quiescent"].as_bool().unwrap_or(false);
+            state.write().await.quiescent = quiescent;
+        }
+        _ => {}
+    }
+}
+
+async fn reply_null(stdin: &Arc<Mutex<tokio::process::ChildStdin>>, id: &Value) {
+    let reply = json!({"jsonrpc": "2.0", "id": id, "result": null}).to_string();
+    let framed = format!("Content-Length: {}\r\n\r\n{}", reply.len(), reply);
+    let mut stdin = stdin.lock().await;
+    let _ = stdin.write_all(framed.as_bytes()).await;
+    let _ = stdin.flush().await;
+}
+
+async fn resolve_pending(pending: &PendingRequests, id: &Value, msg: &Value) {
+    let tx = match id.as_i64() {
+        Some(id) => pending.write().await.remove(&id),
+        None => None,
+    };
+    if let Some(tx) = tx {
+        let outcome = match msg.get("error") {
+            Some(err) => Err(err.to_string()),
+            None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+        };
+        let _ = tx.send(outcome);
+    }
+}
+
+async fn store_diagnostics(state: &Arc<RwLock<AnalysisState>>, msg: &Value) {
+    let params = msg
+        .get("params")
+        .and_then(|p| serde_json::from_value::<PublishDiagnosticsParams>(p.clone()).ok());
+    if let Some(Ok(path)) = params.as_ref().map(|p| p.uri.to_file_path()) {
+        let diagnostics = params.map(|p| p.diagnostics).unwrap_or_default();
+        state
+            .write()
+            .await
+            .diagnostics
+            .insert(diag_key(&path), diagnostics);
     }
 }
 
