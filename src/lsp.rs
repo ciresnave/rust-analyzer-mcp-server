@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{Mutex, RwLock};
-use tower_lsp::lsp_types::*;
+use url::Url;
 
 // LSP Protocol types
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,7 +152,11 @@ async fn store_diagnostics(state: &Arc<RwLock<AnalysisState>>, msg: &Value) {
     let params = msg
         .get("params")
         .and_then(|p| serde_json::from_value::<PublishDiagnosticsParams>(p.clone()).ok());
-    if let Some(Ok(path)) = params.as_ref().map(|p| p.uri.to_file_path()) {
+    let path = params
+        .as_ref()
+        .and_then(|p| Url::parse(p.uri.as_str()).ok())
+        .and_then(|u| u.to_file_path().ok());
+    if let Some(path) = path {
         let diagnostics = params.map(|p| p.diagnostics).unwrap_or_default();
         state
             .write()
