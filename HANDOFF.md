@@ -3,7 +3,7 @@
 Lane: rust-analyzer-mcp-server. Scaled to zero 2026-10-28 (CireSnave ruled; PM start via `lane-restart start`).
 Primary checkout stays on main; untracked `supertool` binary there is not ours (excluded in .git/info/exclude).
 
-Merged: #2-#5, #8, #9, #10 (main version 0.1.7 at last read). Issue #1 closed; no outsider issues open.
+Merged: #2-#5, #8, #9, #10 (main 0.1.7; #7 bumps to 0.1.8 per PM gate). Issue #1 closed; no outsider issues open.
 Open, both the PM's to merge:
 - #7 lane/sweep (worktree wt-sweep): docs/PATENT-SWEEP.md record + addendums; docs only. Rebased on main, mergeable.
 - #6 dependabot bytes 1.10.1 -> 1.12.1: needs a look at CI/Codacy; mine to disposition if asked.

@@ -1,6 +1,6 @@
 [package]
 name = "rust-analyzer-mcp-server"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.85.1"
 description = "MCP server exposing rust-analyzer (diagnostics, hover, definitions, references, completions) over stdio"
