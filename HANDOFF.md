@@ -1,17 +1,16 @@
 # HANDOFF (current state, rewrite not append)
 
-Lane: rust-analyzer-mcp-server. THROTTLED (C:\Projects\THROTTLE.md) until ~2026-10-28T01:00Z: gates/fixes only, no sub-agents,
-no avoidable builds, no new roadmap rows.
+Lane: rust-analyzer-mcp-server. Scaled to zero 2026-10-28 (CireSnave ruled; PM start via `lane-restart start`).
+Primary checkout stays on main; untracked `supertool` binary there is not ours (excluded in .git/info/exclude).
 
-Done: lane setup (#2), issue #1 fix (#3, main 1c37cc3, 0.1.2; reporter `replete` told 10-25, issue auto-closed), patent sweep at 0.1.4
-(record in #7, 16 hits read, 0 needs-review, 5 titles unread). Crate name claimed by PM (0.0.0 placeholder).
+Merged: #2-#5, #8, #9, #10 (main version 0.1.7 at last read). Issue #1 closed; no outsider issues open.
+Open, both the PM's to merge:
+- #7 lane/sweep (worktree wt-sweep): docs/PATENT-SWEEP.md record + addendums; docs only. Rebased on main, mergeable.
+- #6 dependabot bytes 1.10.1 -> 1.12.1: needs a look at CI/Codacy; mine to disposition if asked.
 
-Stack, each based on its parent; PM merges in order; after each merge I run `git rebase --onto origin/main <old parent tip>`
-for the next (squash merges):
-#4 deps/CI/deny (0.1.3, based on main) -> #5 module split (0.1.4) -> #8 Codacy size/complexity + CODEOWNERS + tests moved (0.1.5)
-#7 docs/PATENT-SWEEP.md stacked on #5.
-Codacy dispositions posted on #3 and #4; #5/#8 Codacy verdicts not yet seen.
-
-Not started (blocked by throttle): ROADMAP rows 7 (MCP 2026-07-28 migration) and 8 (tower-lsp replacement); reading the 5 unread patents;
-first real release is the PM's.
-Untracked `supertool` binary in primary is not ours; excluded via .git/info/exclude.
+First action on start: `gh pr view 7` and `gh pr view 6`; read THROTTLE.md; check Codacy annotations on merged heads if any remain.
+Pending: crates.io first release is the PM's (0.0.0 placeholder published; tag v<version> is PM's).
+Patent sweep: US20250231801A1 claim 19 arguable/low/watch; re-read only if it grants unchanged.
+Possible follow-ups (roadmap): tool errors as `isError` results; MCP subscriptions/listen, input_required, cancellation.
+Weekly sweep last reported 10-26. ant-fit census sent 10-28 (maybe: APIAnt, SupervisorAnt, ReleaseAnt, Synapse).
+Rules: CARGO_BUILD_JOBS=2, one build at a time; Sonnet only; never gh auth switch.
