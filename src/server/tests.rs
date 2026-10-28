@@ -174,3 +174,83 @@ async fn test_analysis_state_update() {
     assert_eq!(state.file_versions.get(&PathBuf::from("test.rs")), Some(&1));
     assert!(state.last_update.is_some());
 }
+
+fn modern_request(method: &str, version: &str, params: Value) -> McpRequest {
+    let mut params = params;
+    params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion": version});
+    McpRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: method.to_string(),
+        params: Some(params),
+    }
+}
+
+#[tokio::test]
+async fn test_server_discover() {
+    let server = RustAnalyzerMcpServer::new();
+    let response = server
+        .handle_mcp_request(modern_request("server/discover", "2026-07-28", json!({})))
+        .await
+        .unwrap();
+    let result = response.result.unwrap();
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["supportedVersions"][0], "2026-07-28");
+    assert!(
+        result["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("2025-11-25"))
+    );
+    assert!(result["capabilities"]["tools"].is_object());
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "rust-analyzer-mcp-server"
+    );
+}
+
+#[tokio::test]
+async fn test_modern_tools_list_is_stateless_and_complete() {
+    // No initialize first: the version rides on the request.
+    let server = RustAnalyzerMcpServer::new();
+    let response = server
+        .handle_mcp_request(modern_request("tools/list", "2026-07-28", json!({})))
+        .await
+        .unwrap();
+    let result = response.result.unwrap();
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["tools"].as_array().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn test_legacy_tools_list_has_no_result_type() {
+    let server = RustAnalyzerMcpServer::new();
+    let request = McpRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "tools/list".to_string(),
+        params: None,
+    };
+    let result = server
+        .handle_mcp_request(request)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    assert!(result.get("resultType").is_none());
+}
+
+#[tokio::test]
+async fn test_unsupported_protocol_version_error() {
+    let server = RustAnalyzerMcpServer::new();
+    let response = server
+        .handle_mcp_request(modern_request("tools/list", "1900-01-01", json!({})))
+        .await
+        .unwrap();
+    assert!(response.result.is_none());
+    let error = response.error.unwrap();
+    assert_eq!(error.code, -32022);
+    let data = error.data.unwrap();
+    assert_eq!(data["requested"], "1900-01-01");
+    assert_eq!(data["supported"][0], "2026-07-28");
+}

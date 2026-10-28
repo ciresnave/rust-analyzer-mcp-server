@@ -252,9 +252,18 @@ impl RustAnalyzerMcpServer {
     }
 
     pub async fn handle_mcp_request(&self, request: McpRequest) -> Result<McpResponse> {
+        let modern = requested_modern_version(request.params.as_ref()).map(str::to_owned);
+        if let Some(requested) = modern.as_deref().filter(|v| *v != MODERN_PROTOCOL_VERSION) {
+            return Ok(McpResponse::failure(
+                request.id,
+                unsupported_version_error(requested),
+            ));
+        }
+
         let result = match request.method.as_str() {
             "tools/list" => self.list_tools().await,
             "tools/call" => self.call_tool(request.params).await,
+            "server/discover" => Ok(discover_result()),
             "initialize" => Ok(json!({
                 "protocolVersion": negotiate_protocol_version(request.params.as_ref()),
                 "capabilities": {
@@ -268,24 +277,18 @@ impl RustAnalyzerMcpServer {
             _ => Err(anyhow!("Unknown method: {}", request.method)),
         };
 
-        match result {
-            Ok(res) => Ok(McpResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: Some(res),
-                error: None,
-            }),
-            Err(err) => Ok(McpResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: None,
-                error: Some(McpError {
+        Ok(match result {
+            Ok(res) if modern.is_some() => McpResponse::success(request.id, mark_complete(res)),
+            Ok(res) => McpResponse::success(request.id, res),
+            Err(err) => McpResponse::failure(
+                request.id,
+                McpError {
                     code: -32603,
                     message: err.to_string(),
                     data: None,
-                }),
-            }),
-        }
+                },
+            ),
+        })
     }
 
     async fn list_tools(&self) -> Result<Value> {
