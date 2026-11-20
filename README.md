@@ -415,14 +415,6 @@ This server implements the [Model Context Protocol (MCP)](https://modelcontextpr
    - Ensure the binary has execute permissions
    - Check file paths are accessible
 
-### Debug Mode
-
-Run with debug logging:
-
-```bash
-RUST_LOG=debug ./rust-analyzer-mcp-server /path/to/project
-```
-
 ## Development
 
 ### Building from Source
