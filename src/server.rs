@@ -392,17 +392,37 @@ impl RustAnalyzerMcpServer {
     ) -> Result<Vec<Diagnostic>> {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut resynced = false;
+        let mut empty_since: Option<Instant> = None;
         loop {
             let quiescent = self.analysis_state.read().await.quiescent;
             if quiescent && !resynced {
                 // Anything published while the project was still loading is
                 // incomplete: ask again now that analysis can see everything.
                 resynced = true;
-                self.analysis_state.write().await.diagnostics.remove(key);
+                // An unchanged didChange would not make rust-analyzer publish
+                // again, so close and reopen the document to force it.
+                let uri = path_to_uri(&std::path::absolute(file_path)?)?;
+                client
+                    .send_notification(
+                        "textDocument/didClose",
+                        json!({"textDocument": {"uri": uri}}),
+                    )
+                    .await?;
+                {
+                    let mut state = self.analysis_state.write().await;
+                    state.diagnostics.remove(key);
+                    state.file_versions.remove(&std::path::absolute(file_path)?);
+                }
                 self.open_document(client, file_path).await?;
             } else if quiescent {
                 if let Some(d) = self.analysis_state.read().await.diagnostics.get(key) {
-                    return Ok(d.clone());
+                    // rust-analyzer publishes an empty list first and the semantic
+                    // diagnostics later, so an empty answer must hold for a grace
+                    // period before it is believed.
+                    let settled = *empty_since.get_or_insert_with(Instant::now);
+                    if !d.is_empty() || settled.elapsed() >= Duration::from_secs(5) {
+                        return Ok(d.clone());
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -485,16 +505,20 @@ impl RustAnalyzerMcpServer {
     }
 
     async fn analyze_workspace(&self) -> Result<Value> {
-        let state = self.analysis_state.read().await;
-        let workspace_root = state
+        // Copy the root out and drop the guard: get_diagnostics below takes the
+        // write lock, so holding this read guard would deadlock.
+        let workspace_root = self
+            .analysis_state
+            .read()
+            .await
             .workspace_root
-            .as_ref()
+            .clone()
             .ok_or_else(|| anyhow!("Workspace not initialized"))?;
 
         let mut analysis_results = Vec::new();
 
         // Get all Rust files in workspace
-        let rust_files = Self::find_rust_files(workspace_root).await?;
+        let rust_files = Self::find_rust_files(&workspace_root).await?;
 
         for file in rust_files {
             if let Ok(diagnostics) = self

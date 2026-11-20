@@ -254,3 +254,102 @@ async fn test_unsupported_protocol_version_error() {
     assert_eq!(data["requested"], "1900-01-01");
     assert_eq!(data["supported"][0], "2026-07-28");
 }
+
+const TOOLS_MAIN_RS: &str = "fn helper() -> i32 {
+    1
+}
+fn main() {
+    let x: i32 = \"no\";
+    let _ = helper();
+    let _ = helper();
+    let _s = String::new();
+}
+mod other;
+";
+// Carries its own error: a file with no diagnostics at all is never answered.
+const TOOLS_OTHER_RS: &str = "pub fn broken() -> u8 {
+    \"no\"
+}
+";
+
+/// Drives the five remaining tools against a real rust-analyzer and checks
+/// each answer for a fact only rust-analyzer could have produced. All checks
+/// run before the test fails, so a mutated fixture shows which tool noticed.
+/// Needs `rust-analyzer` on PATH (CI installs it; no `#[ignore]`).
+#[tokio::test]
+async fn test_real_rust_analyzer_tools() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"ws\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), TOOLS_MAIN_RS).unwrap();
+    fs::write(root.join("src/other.rs"), TOOLS_OTHER_RS).unwrap();
+
+    let server = RustAnalyzerMcpServer::new();
+    server
+        .initialize_rust_analyzer(root.to_path_buf())
+        .await
+        .expect("rust-analyzer handshake should succeed");
+
+    let file = root.join("src/main.rs").display().to_string();
+    let at = |line: u32, character: u32| json!({"file_path": file, "line": line, "character": character});
+    let mut failures = Vec::new();
+    let mut check = |name: &str, got: Result<Value>, needle: &str, count: Option<usize>| {
+        let text = match got {
+            Ok(v) => v["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            Err(e) => {
+                failures.push(format!("{name}: error {e}"));
+                return;
+            }
+        };
+        let ok = match count {
+            Some(n) => text.matches(needle).count() == n,
+            None => text.contains(needle),
+        };
+        if !ok {
+            failures.push(format!("{name}: wanted {needle:?} x{count:?} in {text}"));
+        }
+    };
+
+    check(
+        "get_diagnostics",
+        server.get_diagnostics(json!({"file_path": file})).await,
+        "mismatched types",
+        None,
+    );
+    // `helper` call at line 5 -> definition on line 0.
+    check(
+        "goto_definition",
+        server.goto_definition(at(5, 12)).await,
+        "\"line\":0",
+        None,
+    );
+    // declaration + two calls.
+    check(
+        "find_references",
+        server.find_references(at(0, 3)).await,
+        "\"uri\"",
+        Some(3),
+    );
+    check(
+        "get_completions",
+        server.get_completions(at(7, 21)).await,
+        "\"label\":\"new\"",
+        None,
+    );
+    check(
+        "analyze_workspace",
+        server.analyze_workspace().await,
+        "Analyzed 2 files",
+        None,
+    );
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
