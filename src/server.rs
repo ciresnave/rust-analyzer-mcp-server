@@ -95,7 +95,10 @@ impl RustAnalyzerMcpServer {
 
     /// Spawn rust-analyzer and the task that reads its replies.
     fn spawn_lsp_client(&self) -> Result<LspClient> {
-        let mut child = Command::new("rust-analyzer")
+        let ra_path = std::env::var_os("RUST_ANALYZER_PATH")
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "rust-analyzer".into());
+        let mut child = Command::new(ra_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
