@@ -138,7 +138,7 @@ cargo build --release
 
 #### Pre-built Binaries
 
-Download the latest release from the [releases page](https://github.com/CireSnave/rust-analyzer-mcp-server/releases).
+No release has been published yet (not on crates.io or the GitHub releases page); build from source.
 
 ### Verification
 
@@ -153,6 +153,7 @@ rust-analyzer-mcp-server --help
 
 # Test with current directory
 rust-analyzer-mcp-server .
+```
 
 ## Uninstallation
 
@@ -350,7 +351,6 @@ The server communicates via JSON-RPC over stdin/stdout following the MCP protoco
 
 ### Environment Variables
 
-- `RUST_LOG`: Set logging level (e.g., `debug`, `info`, `warn`, `error`)
 - `RUST_ANALYZER_PATH`: Custom path to rust-analyzer binary (if not in PATH)
 
 ### Workspace Setup
