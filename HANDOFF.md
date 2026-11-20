@@ -10,7 +10,8 @@ Branch `lane/real-ra-tools` (worktree `-wt-tools`, head pushed, NO PR): test_rea
 TASK 1 (11-21 UTC): open ONE day PR from it, say #11 already merged 11-20, list 3 bugs + test name, send [READY] to pm-assist
 cc pm-platform; pm-assist allocates the version. Do NOT push to a branch after its waiter is armed.
 TASK 2: #12 repro with raw LSP (rust-analyzer alone), then decide ours vs rust-analyzer's.
-Asked pm-platform (routed to PM): publish 0.1.11 after the day PR? Answer pending; release/tag are PM's. Keep README install path honest.
+PM agreed: publish 0.1.11 after the day PR merges + main CI green: [READY] to pm-assist cc pm-platform and PM. PM publishes+tags;
+README install path changes only after the publish read-back.
 Patent sweep: US20250231801A1 claim 19 arguable/low/watch. Possible follow-ups: tool errors as `isError`; MCP subscriptions/cancellation.
 Rules: CARGO_BUILD_JOBS=2, one build at a time; Sonnet only; never gh auth switch.
 
