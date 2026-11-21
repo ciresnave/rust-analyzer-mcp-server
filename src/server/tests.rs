@@ -265,6 +265,7 @@ fn main() {
     let _s = String::new();
 }
 mod other;
+mod clean;
 ";
 // Carries its own error: a file with no diagnostics at all is never answered.
 const TOOLS_OTHER_RS: &str = "pub fn broken() -> u8 {
@@ -272,84 +273,121 @@ const TOOLS_OTHER_RS: &str = "pub fn broken() -> u8 {
 }
 ";
 
-/// Drives the five remaining tools against a real rust-analyzer and checks
-/// each answer for a fact only rust-analyzer could have produced. All checks
-/// run before the test fails, so a mutated fixture shows which tool noticed.
-/// Needs `rust-analyzer` on PATH (CI installs it; no `#[ignore]`).
-#[tokio::test]
-async fn test_real_rust_analyzer_tools() {
+// Clean on purpose: the only fixture that exercises an empty answer.
+const TOOLS_CLEAN_RS: &str = "pub fn fine() -> u8 {
+    1
+}
+";
+
+/// A package with the three fixture files and a server that has loaded it.
+async fn tools_fixture() -> (TempDir, RustAnalyzerMcpServer) {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path();
     fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"ws\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]
+name = \"ws\"
+version = \"0.1.0\"
+edition = \"2021\"
+",
     )
     .unwrap();
     fs::create_dir(root.join("src")).unwrap();
     fs::write(root.join("src/main.rs"), TOOLS_MAIN_RS).unwrap();
     fs::write(root.join("src/other.rs"), TOOLS_OTHER_RS).unwrap();
-
+    fs::write(root.join("src/clean.rs"), TOOLS_CLEAN_RS).unwrap();
     let server = RustAnalyzerMcpServer::new();
     server
         .initialize_rust_analyzer(root.to_path_buf())
         .await
         .expect("rust-analyzer handshake should succeed");
+    (temp_dir, server)
+}
 
-    let file = root.join("src/main.rs").display().to_string();
-    let at = |line: u32, character: u32| json!({"file_path": file, "line": line, "character": character});
-    let mut failures = Vec::new();
-    let mut check = |name: &str, got: Result<Value>, needle: &str, count: Option<usize>| {
+/// Collects failed checks so one run shows every tool that went wrong.
+#[derive(Default)]
+struct Checks(Vec<String>);
+
+impl Checks {
+    fn check(&mut self, name: &str, got: Result<Value>, needle: &str, count: Option<usize>) {
         let text = match got {
             Ok(v) => v["content"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
-            Err(e) => {
-                failures.push(format!("{name}: error {e}"));
-                return;
-            }
+            Err(e) => return self.0.push(format!("{name}: error {e}")),
         };
         let ok = match count {
             Some(n) => text.matches(needle).count() == n,
             None => text.contains(needle),
         };
         if !ok {
-            failures.push(format!("{name}: wanted {needle:?} x{count:?} in {text}"));
+            self.0
+                .push(format!("{name}: wanted {needle:?} x{count:?} in {text}"));
         }
-    };
+    }
+}
 
-    check(
-        "get_diagnostics",
-        server.get_diagnostics(json!({"file_path": file})).await,
-        "mismatched types",
-        None,
-    );
+/// A clean file's empty answer must not come back before the grace period:
+/// rust-analyzer publishes an empty list first and the real one later.
+async fn check_empty_grace(server: &RustAnalyzerMcpServer, root: &std::path::Path, c: &mut Checks) {
+    let clean = root.join("src/clean.rs").display().to_string();
+    let started = std::time::Instant::now();
+    let got = server.get_diagnostics(json!({"file_path": clean})).await;
+    c.check("get_diagnostics(clean)", got, ": []", None);
+    if started.elapsed() < Duration::from_millis(4900) {
+        c.0.push(format!("empty answer after only {:?}", started.elapsed()));
+    }
+}
+
+/// Drives the five remaining tools against a real rust-analyzer and checks
+/// each answer for a fact only rust-analyzer could have produced. All checks
+/// run before the test fails, so a mutated fixture shows which tool noticed.
+/// Needs `rust-analyzer` on PATH (CI installs it; no `#[ignore]`).
+#[tokio::test]
+async fn test_real_rust_analyzer_tools() {
+    let (temp_dir, server) = tools_fixture().await;
+    let root = temp_dir.path();
+    let file = root.join("src/main.rs").display().to_string();
+    let at = |line: u32, character: u32| json!({"file_path": file, "line": line, "character": character});
+    let mut c = Checks::default();
+
+    let got = server.get_diagnostics(json!({"file_path": file})).await;
+    c.check("get_diagnostics", got, "mismatched types", None);
+    check_empty_grace(&server, root, &mut c).await;
     // `helper` call at line 5 -> definition on line 0.
-    check(
+    c.check(
         "goto_definition",
         server.goto_definition(at(5, 12)).await,
         "\"line\":0",
         None,
     );
     // declaration + two calls.
-    check(
+    c.check(
         "find_references",
         server.find_references(at(0, 3)).await,
         "\"uri\"",
         Some(3),
     );
-    check(
+    c.check(
         "get_completions",
         server.get_completions(at(7, 21)).await,
         "\"label\":\"new\"",
         None,
     );
-    check(
+    c.check(
         "analyze_workspace",
         server.analyze_workspace().await,
-        "Analyzed 2 files",
+        "Analyzed 3 files",
         None,
     );
 
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        c.0.is_empty(),
+        "{}",
+        c.0.join(
+            "
+"
+        )
+    );
 }

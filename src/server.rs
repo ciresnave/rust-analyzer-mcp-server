@@ -12,6 +12,9 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use url::Url;
 
+/// How long an empty diagnostics list must stand before it is believed.
+const EMPTY_GRACE: Duration = Duration::from_secs(5);
+
 /// MCP tool result carrying a single text block.
 fn text_result(text: String) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
@@ -86,6 +89,7 @@ impl RustAnalyzerMcpServer {
                 last_update: None,
                 file_versions: HashMap::new(),
                 diagnostics: HashMap::new(),
+                diag_seq: 0,
                 workspace_root: None,
                 quiescent: false,
             })),
@@ -128,6 +132,7 @@ impl RustAnalyzerMcpServer {
             stdin,
             request_id: Arc::new(Mutex::new(1)),
             pending_requests: pending,
+            doc_sync: Mutex::new(()),
             _child: child,
         })
     }
@@ -221,18 +226,32 @@ impl RustAnalyzerMcpServer {
         path: &Path,
         analysis_state: &Arc<RwLock<AnalysisState>>,
     ) -> Result<()> {
+        let _sync = client.doc_sync.lock().await;
+        Self::sync_document(client, path, analysis_state, false).await
+    }
+
+    /// Allocate the next version and send it. Versions only ever grow, also
+    /// across a reopen, so a publication for an older version is recognisable.
+    /// The caller holds `client.doc_sync`.
+    async fn sync_document(
+        client: &LspClient,
+        path: &Path,
+        analysis_state: &Arc<RwLock<AnalysisState>>,
+        reopen: bool,
+    ) -> Result<()> {
         let uri = path_to_uri(path)?;
         let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
 
-        let version = {
+        let (version, first) = {
             let mut state = analysis_state.write().await;
-            let version = state.file_versions.get(path).map_or(1, |v| v + 1);
+            let previous = state.file_versions.get(path).copied();
+            let version = previous.map_or(1, |v| v + 1);
             state.file_versions.insert(path.to_path_buf(), version);
             state.last_update = Some(Instant::now());
-            version
+            (version, previous.is_none() || reopen)
         };
 
-        if version == 1 {
+        if first {
             client
                 .send_notification(
                     "textDocument/didOpen",
@@ -383,6 +402,23 @@ impl RustAnalyzerMcpServer {
         )))
     }
 
+    /// Close and reopen the document so rust-analyzer publishes afresh (an
+    /// unchanged didChange would not). One locked step, so a watcher update
+    /// cannot slip between the close and the open.
+    async fn resync_document(&self, client: &LspClient, file_path: &str, key: &Path) -> Result<()> {
+        let path = std::path::absolute(file_path)?;
+        let uri = path_to_uri(&path)?;
+        let _sync = client.doc_sync.lock().await;
+        client
+            .send_notification(
+                "textDocument/didClose",
+                json!({"textDocument": {"uri": uri}}),
+            )
+            .await?;
+        self.analysis_state.write().await.diagnostics.remove(key);
+        Self::sync_document(client, &path, &self.analysis_state, true).await
+    }
+
     /// rust-analyzer pushes diagnostics asynchronously; wait for them.
     async fn wait_for_diagnostics(
         &self,
@@ -390,38 +426,40 @@ impl RustAnalyzerMcpServer {
         file_path: &str,
         key: &Path,
     ) -> Result<Vec<Diagnostic>> {
+        let path = std::path::absolute(file_path)?;
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut resynced = false;
-        let mut empty_since: Option<Instant> = None;
+        // The empty answer being timed: its publication, and when we first saw it.
+        let mut empty: Option<(u64, Instant)> = None;
         loop {
             let quiescent = self.analysis_state.read().await.quiescent;
             if quiescent && !resynced {
                 // Anything published while the project was still loading is
                 // incomplete: ask again now that analysis can see everything.
                 resynced = true;
-                // An unchanged didChange would not make rust-analyzer publish
-                // again, so close and reopen the document to force it.
-                let uri = path_to_uri(&std::path::absolute(file_path)?)?;
-                client
-                    .send_notification(
-                        "textDocument/didClose",
-                        json!({"textDocument": {"uri": uri}}),
-                    )
-                    .await?;
-                {
-                    let mut state = self.analysis_state.write().await;
-                    state.diagnostics.remove(key);
-                    state.file_versions.remove(&std::path::absolute(file_path)?);
-                }
-                self.open_document(client, file_path).await?;
+                self.resync_document(client, file_path, key).await?;
             } else if quiescent {
-                if let Some(d) = self.analysis_state.read().await.diagnostics.get(key) {
+                let state = self.analysis_state.read().await;
+                // A publication for an older version of the document (sent
+                // before the resync) must not answer for the current one.
+                let current = state.file_versions.get(&path).copied();
+                if let Some(e) = state
+                    .diagnostics
+                    .get(key)
+                    .filter(|e| e.version.is_none_or(|v| Some(v) == current))
+                {
                     // rust-analyzer publishes an empty list first and the semantic
                     // diagnostics later, so an empty answer must hold for a grace
-                    // period before it is believed.
-                    let settled = *empty_since.get_or_insert_with(Instant::now);
-                    if !d.is_empty() || settled.elapsed() >= Duration::from_secs(5) {
-                        return Ok(d.clone());
+                    // period, counted from the publication it applies to.
+                    let since = match empty {
+                        Some((seq, at)) if seq == e.seq => at,
+                        _ => {
+                            empty = Some((e.seq, Instant::now()));
+                            Instant::now()
+                        }
+                    };
+                    if !e.items.is_empty() || since.elapsed() >= EMPTY_GRACE {
+                        return Ok(e.items.clone());
                     }
                 }
             }
@@ -520,17 +558,17 @@ impl RustAnalyzerMcpServer {
         // Get all Rust files in workspace
         let rust_files = Self::find_rust_files(&workspace_root).await?;
 
-        for file in rust_files {
-            if let Ok(diagnostics) = self
-                .get_diagnostics(json!({"file_path": file.display().to_string()}))
+        // Concurrently: each clean file waits out the empty-answer grace, and
+        // one after another that adds five seconds per file.
+        let results = futures_util::future::join_all(rust_files.iter().map(|file| async move {
+            let name = file.display().to_string();
+            self.get_diagnostics(json!({"file_path": name.clone()}))
                 .await
-            {
-                analysis_results.push(json!({
-                    "file": file.display().to_string(),
-                    "diagnostics": diagnostics
-                }));
-            }
-        }
+                .ok()
+                .map(|diagnostics| json!({"file": name, "diagnostics": diagnostics}))
+        }))
+        .await;
+        analysis_results.extend(results.into_iter().flatten());
 
         Ok(json!({
             "content": [{

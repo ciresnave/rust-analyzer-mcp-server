@@ -32,10 +32,21 @@ pub(crate) struct LspNotification {
 pub struct AnalysisState {
     pub last_update: Option<Instant>,
     pub file_versions: HashMap<PathBuf, u64>,
-    pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    pub diagnostics: HashMap<PathBuf, DiagEntry>,
+    /// Counts every stored publication, so a waiter can tell a new one apart.
+    pub diag_seq: u64,
     pub workspace_root: Option<PathBuf>,
     /// rust-analyzer finished loading/indexing (experimental/serverStatus).
     pub quiescent: bool,
+}
+
+/// One `publishDiagnostics` as stored: the document version rust-analyzer says
+/// it analysed (absent if it did not say) and when we stored it.
+#[derive(Debug, Clone)]
+pub struct DiagEntry {
+    pub version: Option<u64>,
+    pub seq: u64,
+    pub items: Vec<Diagnostic>,
 }
 
 // LSP Client for communicating with rust-analyzer
@@ -43,6 +54,10 @@ pub struct LspClient {
     pub(crate) stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     pub(crate) request_id: Arc<Mutex<i64>>,
     pub(crate) pending_requests: PendingRequests,
+    /// Held while a document's version is allocated and its notification is
+    /// sent, and across a close/reopen, so versions reach rust-analyzer in the
+    /// order they were allocated.
+    pub(crate) doc_sync: Mutex<()>,
     pub(crate) _child: Child,
 }
 
@@ -157,12 +172,22 @@ async fn store_diagnostics(state: &Arc<RwLock<AnalysisState>>, msg: &Value) {
         .and_then(|p| Url::parse(p.uri.as_str()).ok())
         .and_then(|u| u.to_file_path().ok());
     if let Some(path) = path {
-        let diagnostics = params.map(|p| p.diagnostics).unwrap_or_default();
-        state
-            .write()
-            .await
-            .diagnostics
-            .insert(diag_key(&path), diagnostics);
+        let version = params
+            .as_ref()
+            .and_then(|p| p.version)
+            .and_then(|v| u64::try_from(v).ok());
+        let items = params.map(|p| p.diagnostics).unwrap_or_default();
+        let mut state = state.write().await;
+        state.diag_seq += 1;
+        let seq = state.diag_seq;
+        state.diagnostics.insert(
+            diag_key(&path),
+            DiagEntry {
+                version,
+                seq,
+                items,
+            },
+        );
     }
 }
 
