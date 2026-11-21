@@ -1,6 +1,6 @@
 [package]
 name = "rust-analyzer-mcp-server"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 rust-version = "1.85.1"
 description = "MCP server exposing rust-analyzer (diagnostics, hover, definitions, references, completions) over stdio"
@@ -19,6 +19,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 notify = "8.2"
 anyhow = "1.0.104"
 clap = { version = "4.6", features = ["derive"] }
+futures-util = "0.3.34"
 
 [dev-dependencies]
 tempfile = "3.27"
