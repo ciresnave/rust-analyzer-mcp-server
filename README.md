@@ -21,6 +21,15 @@ A Model Context Protocol (MCP) server that provides Rust language analysis capab
 
 ## Installation
 
+### From crates.io (recommended)
+
+```bash
+cargo install rust-analyzer-mcp-server
+```
+
+This installs the `rust-analyzer-mcp-server` binary (0.1.11 or later) into Cargo's bin directory; you still need
+`rust-analyzer` on your `PATH` (or set `RUST_ANALYZER_PATH`). The installers below build from a clone instead.
+
 ### Quick One-Line Installation
 
 For the fastest installation, use these one-liners:

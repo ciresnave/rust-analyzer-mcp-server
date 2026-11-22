@@ -20,6 +20,10 @@ fn text_result(text: String) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
 }
 
+fn tool_error_result(text: String) -> Value {
+    json!({"content": [{"type": "text", "text": text}], "isError": true})
+}
+
 fn tool(name: &str, description: &str, input_schema: Value) -> ToolDefinition {
     ToolDefinition {
         name: name.to_string(),
@@ -370,15 +374,18 @@ impl RustAnalyzerMcpServer {
             .ok_or_else(|| anyhow!("No tool name provided"))?;
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        match tool_name {
+        let outcome = match tool_name {
             "get_diagnostics" => self.get_diagnostics(arguments).await,
             "get_hover_info" => self.get_hover_info(arguments).await,
             "goto_definition" => self.goto_definition(arguments).await,
             "find_references" => self.find_references(arguments).await,
             "get_completions" => self.get_completions(arguments).await,
             "analyze_workspace" => self.analyze_workspace().await,
-            _ => Err(anyhow!("Unknown tool: {}", tool_name)),
-        }
+            _ => return Err(anyhow!("Unknown tool: {}", tool_name)),
+        };
+        // MCP: a failure while running a known tool is a tool-execution error
+        // (`isError` result the model can read), not a JSON-RPC protocol error.
+        Ok(outcome.unwrap_or_else(|err| tool_error_result(format!("{err:#}"))))
     }
 
     async fn get_diagnostics(&self, args: Value) -> Result<Value> {

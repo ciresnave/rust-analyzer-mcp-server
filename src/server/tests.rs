@@ -87,6 +87,37 @@ async fn test_unknown_method() {
 }
 
 #[tokio::test]
+async fn test_tool_failure_is_is_error_result_not_protocol_error() {
+    let server = RustAnalyzerMcpServer::new();
+    let call = |name: &str| McpRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "tools/call".to_string(),
+        params: Some(json!({"name": name, "arguments": {"file_path": "x.rs"}})),
+    };
+
+    // Known tool, no LSP client: a tool-execution failure -> isError result.
+    let r = server
+        .handle_mcp_request(call("get_diagnostics"))
+        .await
+        .unwrap();
+    assert!(r.error.is_none());
+    let result = r.result.unwrap();
+    assert_eq!(result["isError"], json!(true));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("LSP client not initialized")
+    );
+
+    // Unknown tool stays a protocol error.
+    let r = server.handle_mcp_request(call("nope")).await.unwrap();
+    assert!(r.result.is_none());
+    assert_eq!(r.error.unwrap().code, -32603);
+}
+
+#[tokio::test]
 async fn test_find_rust_files() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
