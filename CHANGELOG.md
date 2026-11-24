@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13 - 2026-11-24 (allocated by pm-assist)
+
+- Docs and lock only: README note for #12; `url` 2.5.9 in Cargo.lock (RUSTSEC-2026-0592).
+
 ## 0.1.12 - 2026-11-22 (allocated by pm-assist)
 
 - Fixes: a failure inside a known tool is now an MCP tool-execution error (`isError` result the model can read), not a JSON-RPC protocol error; an unknown tool is still a protocol error. Tests added.
