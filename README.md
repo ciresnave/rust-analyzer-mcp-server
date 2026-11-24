@@ -424,6 +424,9 @@ This server implements the [Model Context Protocol (MCP)](https://modelcontextpr
    - Ensure the binary has execute permissions
    - Check file paths are accessible
 
+4. **`get_diagnostics` returns `[]` for `src/main.rs` when `src/lib.rs` exists in the same package** (known limitation, issue #12):
+   - Raw rust-analyzer (1.100.0, no MCP layer) behaves the same, so this is upstream behaviour for same-name lib+bin targets, not this server
+
 ## Development
 
 ### Building from Source
